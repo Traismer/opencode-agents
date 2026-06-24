@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "opencode-agents"
+version = "0.1.0"
+description = "Multi-agent orchestration framework with file-based coordination"
+authors = ["traismer <alekstrais@yandex.ru>"]
+readme = "README.md"
+packages = [{ include = "opencode_agents", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.13"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
