@@ -63,6 +63,9 @@ def _update_env(key: str, model: str | None = None):
     env_path.write_text(text)
 
 
+_FAILED_MODELS: set[str] = set()
+
+
 def _refresh_free_key():
     model = os.environ.get("FREE_API_MODEL", FREE_API_MODEL)
     print(f"  [free] ключ умер, ищу свежий для {model}...")
@@ -76,7 +79,6 @@ def _refresh_free_key():
         print(f"  [free] ошибка загрузки ключей: {e}")
         return False
 
-    # сначала ищем ключ для указанной модели
     sections = re.split(r'\n(?=###\s)', resp.text)
     all_rows: list[tuple[str, str, str]] = []  # title, key, model
     for sec in sections:
@@ -88,16 +90,18 @@ def _refresh_free_key():
 
     # сначала поиск по указанной модели
     for title, key, m in all_rows:
+        if m in _FAILED_MODELS:
+            continue
         if _match_model(model, m):
             _update_env(key, m)
             print(f"  [free] новый ключ {m}: {key[:20]}...")
             return True
 
-    # не нашли — ротация: пробуем все модели подряд
+    # не нашли — ротация: пробуем все модели подряд, пропуская упавшие
     print(f"  [free] {model} не найден, ротация по всем моделям...")
     seen = set()
     for title, key, m in all_rows:
-        if m in seen:
+        if m in seen or m in _FAILED_MODELS:
             continue
         seen.add(m)
         _update_env(key, m)
@@ -110,7 +114,7 @@ def _refresh_free_key():
 
 def _is_auth_error(e: Exception) -> bool:
     if isinstance(e, httpx.HTTPStatusError):
-        return e.response.status_code in (401, 402, 403, 429)
+        return e.response.status_code in (401, 402, 403, 404, 429)
     return False
 
 
@@ -214,8 +218,10 @@ def cmd_advance(ws: Workspace, args: list[str]):
                 return
 
         except Exception as e:
-            if _is_auth_error(e) and _refresh_free_key():
-                continue
+            if _is_auth_error(e):
+                _FAILED_MODELS.add(os.environ.get("FREE_API_MODEL", ""))
+                if _refresh_free_key():
+                    continue
             print(f"  [{task_id}] ошибка: {e}")
             return
 
@@ -237,6 +243,7 @@ def cmd_run_planner(ws: Workspace, args: list[str]):
                     result = agent.process(session)
                 except Exception as e:
                     if _is_auth_error(e):
+                        _FAILED_MODELS.add(os.environ.get("FREE_API_MODEL", ""))
                         if _refresh_free_key():
                             agent = PlannerAgent(llm=_resolve_llm())
                             cooldown = 0
@@ -270,6 +277,7 @@ def cmd_run_critic(ws: Workspace, args: list[str]):
                     result = agent.process(session)
                 except Exception as e:
                     if _is_auth_error(e):
+                        _FAILED_MODELS.add(os.environ.get("FREE_API_MODEL", ""))
                         if _refresh_free_key():
                             agent = CriticAgent(llm=_resolve_llm())
                             cooldown = 0
