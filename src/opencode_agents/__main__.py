@@ -8,13 +8,14 @@ from opencode_agents.workspace import Workspace
 from opencode_agents.models import HistoryEntry
 from opencode_agents.agents.planner import PlannerAgent
 from opencode_agents.agents.critic import CriticAgent
-from opencode_agents.llm import DeepSeekLLM, StubLLM
+from opencode_agents.llm import DeepSeekLLM, FreeLLM, StubLLM
 
 
 def _resolve_llm():
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if api_key:
-        return DeepSeekLLM(api_key=api_key)
+    if os.environ.get("FREE_API_KEY"):
+        return FreeLLM()
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return DeepSeekLLM()
     return StubLLM()
 
 
@@ -162,6 +163,38 @@ def cmd_run_critic(ws: Workspace, args: list[str]):
         time.sleep(2)
 
 
+def cmd_fetch_keys(ws: Workspace, args: list[str]):
+    import httpx
+    import re
+
+    print("Загрузка ключей из alistaitsacle/free-llm-api-keys...")
+    try:
+        resp = httpx.get("https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/main/README.md", timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Ошибка загрузки: {e}")
+        return
+
+    text = resp.text
+    sections = re.split(r'\n(?=###\s)', text)
+    found = []
+    for sec in sections:
+        title_m = re.match(r'###\s+(.+?)(?:\s+`[^`]+`)?\s*$', sec, re.MULTILINE)
+        title = title_m.group(1).strip() if title_m else ""
+        rows = re.findall(r'\|\s*`(sk-\w+)`\s*\|\s*(\S+?)\s*\|', sec)
+        if rows:
+            found.append((title, rows))
+
+    print(f"\nНайдено {len(found)} разделов:")
+    for title, rows in found:
+        print(f"\n  {title}")
+        for key, model in rows[:3]:
+            print(f"    модель: {model}")
+            print(f"    ключ: {key[:20]}...")
+            print(f"    export FREE_API_KEY={key}")
+            print(f"    export FREE_API_MODEL={model}")
+
+
 def help_text():
     print("Использование: python -m opencode_agents <команда> [args]")
     print()
@@ -172,9 +205,13 @@ def help_text():
     print("  advance <task_id>            Один шаг (planner или critic)")
     print("  run-planner                  Демон planner (цикл)")
     print("  run-critic                   Демон critic (цикл)")
+    print("  fetch-keys                   Получить бесплатные API-ключи с GitHub")
     print()
     print("Переменные окружения:")
-    print("  DEEPSEEK_API_KEY             API-ключ DeepSeek (без него — StubLLM)")
+    print("  FREE_API_KEY                 Бесплатный API-ключ (приоритет)")
+    print("  FREE_API_MODEL               Модель для FreeLLM (по умолч. deepseek/deepseek-v4-flash)")
+    print("  FREE_API_BASE_URL            Базовый URL (по умолч. https://aiapiv2.pekpik.com/v1)")
+    print("  DEEPSEEK_API_KEY             API-ключ DeepSeek (если нет FREE_API_KEY)")
 
 
 COMMANDS = {
@@ -184,6 +221,7 @@ COMMANDS = {
     "advance": cmd_advance,
     "run-planner": cmd_run_planner,
     "run-critic": cmd_run_critic,
+    "fetch-keys": cmd_fetch_keys,
 }
 
 

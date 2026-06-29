@@ -138,7 +138,10 @@ poetry run python -m opencode_agents advance task-abc123   # critic аппрув
 
 | Переменная | Назначение |
 |-----------|-----------|
-| `DEEPSEEK_API_KEY` | API-ключ DeepSeek для реального LLM (без него — StubLLM) |
+| `FREE_API_KEY` | Бесплатный ключ (приоритет) из `fetch-keys` |
+| `FREE_API_MODEL` | Модель (по умолч. `deepseek/deepseek-v4-flash`) |
+| `FREE_API_BASE_URL` | Базовый URL (по умолч. `https://aiapiv2.pekpik.com/v1`) |
+| `DEEPSEEK_API_KEY` | API-ключ DeepSeek (если нет `FREE_API_KEY`) |
 | (нет) | context7 MCP через npx, если Node.js установлен |
 
 ## Шаблон нового агента
