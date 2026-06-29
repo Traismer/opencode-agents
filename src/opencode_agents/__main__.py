@@ -29,9 +29,10 @@ def _match_model(needle: str, haystack: str) -> bool:
     if a == b:
         return True
     # deepseek-v4-flash → deepseek/deepseek-v4-flash
-    if b.endswith("-" + a) or b.endswith("/" + a):
+    if b == a.split("-")[-1]:
         return True
-    if a.endswith("-" + b.split("-")[-1]) or a.endswith("/" + b.split("/")[-1]):
+    # deepseek/deepseek-v4-flash → deepseek-v4-flash
+    if a == b.split("-")[-1]:
         return True
     return False
 
@@ -41,6 +42,25 @@ def _find_key_for_model(rows: list[tuple[str, str]], model: str) -> str | None:
         if _match_model(model, m):
             return key
     return None
+
+
+def _update_env(key: str, model: str | None = None):
+    os.environ["FREE_API_KEY"] = key
+    if model:
+        os.environ["FREE_API_MODEL"] = model
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    text = env_path.read_text()
+    if "FREE_API_KEY=" in text:
+        text = re.sub(r'^FREE_API_KEY=.*', f'FREE_API_KEY={key}', text, flags=re.MULTILINE)
+    else:
+        text += f'\nFREE_API_KEY={key}\n'
+    if model and "FREE_API_MODEL=" in text:
+        text = re.sub(r'^FREE_API_MODEL=.*', f'FREE_API_MODEL={model}', text, flags=re.MULTILINE)
+    elif model:
+        text += f'\nFREE_API_MODEL={model}\n'
+    env_path.write_text(text)
 
 
 def _refresh_free_key():
@@ -56,26 +76,35 @@ def _refresh_free_key():
         print(f"  [free] ошибка загрузки ключей: {e}")
         return False
 
+    # сначала ищем ключ для указанной модели
     sections = re.split(r'\n(?=###\s)', resp.text)
+    all_rows: list[tuple[str, str, str]] = []  # title, key, model
     for sec in sections:
+        title_m = re.match(r'###\s+(.+?)(?:\s+`[^`]+`)?\s*$', sec, re.MULTILINE)
+        title = title_m.group(1).strip() if title_m else ""
         rows = re.findall(r'\|\s*`(sk-\w+)`\s*\|\s*(\S+?)\s*\|', sec)
-        if not rows:
-            continue
-        key = _find_key_for_model(rows, model)
-        if key:
-            os.environ["FREE_API_KEY"] = key
-            env_path = Path(".env")
-            if env_path.exists():
-                text = env_path.read_text()
-                if "FREE_API_KEY=" in text:
-                    text = re.sub(r'^FREE_API_KEY=.*', f'FREE_API_KEY={key}', text, flags=re.MULTILINE)
-                else:
-                    text += f'\nFREE_API_KEY={key}\n'
-                env_path.write_text(text)
-            print(f"  [free] новый ключ: {key[:20]}...")
+        for key, m in rows:
+            all_rows.append((title, key, m))
+
+    # сначала поиск по указанной модели
+    for title, key, m in all_rows:
+        if _match_model(model, m):
+            _update_env(key, m)
+            print(f"  [free] новый ключ {m}: {key[:20]}...")
             return True
 
-    print(f"  [free] не нашёл ключ для {model}")
+    # не нашли — ротация: пробуем все модели подряд
+    print(f"  [free] {model} не найден, ротация по всем моделям...")
+    seen = set()
+    for title, key, m in all_rows:
+        if m in seen:
+            continue
+        seen.add(m)
+        _update_env(key, m)
+        print(f"  [free] пробуем {m}: {key[:20]}...")
+        return True
+
+    print(f"  [free] нет доступных ключей")
     return False
 
 
@@ -196,16 +225,23 @@ def cmd_advance(ws: Workspace, args: list[str]):
 def cmd_run_planner(ws: Workspace, args: list[str]):
     agent = PlannerAgent(llm=_resolve_llm())
     print("[planner] ожидание задач...")
+    cooldown = 0
     while True:
+        if cooldown > 0:
+            time.sleep(cooldown)
+            cooldown = 0
         for t in ws.list_tasks():
             session = ws.read_session(t.task_id)
             if session and session.status == "planner_turn":
                 try:
                     result = agent.process(session)
                 except Exception as e:
-                    if _is_auth_error(e) and _refresh_free_key():
-                        agent = PlannerAgent(llm=_resolve_llm())
-                        continue
+                    if _is_auth_error(e):
+                        if _refresh_free_key():
+                            agent = PlannerAgent(llm=_resolve_llm())
+                            cooldown = 0
+                            continue
+                        cooldown = 60
                     print(f"  [planner] {t.task_id} ошибка: {e}")
                     time.sleep(10)
                     continue
@@ -215,23 +251,30 @@ def cmd_run_planner(ws: Workspace, args: list[str]):
                 ))
                 session.status = "critic_turn"
                 ws.update_session(session)
-                print(f"  [planner] {t.task_id} итер {session.iteration} — готово")
+                print(f"  [planner] {t.task_id} итер {session.iteration} — готово ({len(session.plan)} симв.)")
         time.sleep(2)
 
 
 def cmd_run_critic(ws: Workspace, args: list[str]):
     agent = CriticAgent(llm=_resolve_llm())
     print("[critic] ожидание задач...")
+    cooldown = 0
     while True:
+        if cooldown > 0:
+            time.sleep(cooldown)
+            cooldown = 0
         for t in ws.list_tasks():
             session = ws.read_session(t.task_id)
             if session and session.status == "critic_turn":
                 try:
                     result = agent.process(session)
                 except Exception as e:
-                    if _is_auth_error(e) and _refresh_free_key():
-                        agent = CriticAgent(llm=_resolve_llm())
-                        continue
+                    if _is_auth_error(e):
+                        if _refresh_free_key():
+                            agent = CriticAgent(llm=_resolve_llm())
+                            cooldown = 0
+                            continue
+                        cooldown = 60
                     print(f"  [critic] {t.task_id} ошибка: {e}")
                     time.sleep(10)
                     continue
