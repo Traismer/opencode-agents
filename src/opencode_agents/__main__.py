@@ -23,6 +23,26 @@ def _resolve_llm():
     return StubLLM()
 
 
+def _match_model(needle: str, haystack: str) -> bool:
+    a = needle.strip().lower().replace("/", "-").replace(" ", "-")
+    b = haystack.strip().lower().replace("/", "-").replace(" ", "-")
+    if a == b:
+        return True
+    # deepseek-v4-flash → deepseek/deepseek-v4-flash
+    if b.endswith("-" + a) or b.endswith("/" + a):
+        return True
+    if a.endswith("-" + b.split("-")[-1]) or a.endswith("/" + b.split("/")[-1]):
+        return True
+    return False
+
+
+def _find_key_for_model(rows: list[tuple[str, str]], model: str) -> str | None:
+    for key, m in rows:
+        if _match_model(model, m):
+            return key
+    return None
+
+
 def _refresh_free_key():
     model = os.environ.get("FREE_API_MODEL", FREE_API_MODEL)
     print(f"  [free] ключ умер, ищу свежий для {model}...")
@@ -39,21 +59,23 @@ def _refresh_free_key():
     sections = re.split(r'\n(?=###\s)', resp.text)
     for sec in sections:
         rows = re.findall(r'\|\s*`(sk-\w+)`\s*\|\s*(\S+?)\s*\|', sec)
-        for key, m in rows:
-            if m == model:
-                os.environ["FREE_API_KEY"] = key
-                env_path = Path(".env")
-                if env_path.exists():
-                    text = env_path.read_text()
-                    if "FREE_API_KEY=" in text:
-                        text = re.sub(r'^FREE_API_KEY=.*', f'FREE_API_KEY={key}', text, flags=re.MULTILINE)
-                    else:
-                        text += f'\nFREE_API_KEY={key}\n'
-                    env_path.write_text(text)
-                print(f"  [free] новый ключ: {key[:20]}...")
-                return True
+        if not rows:
+            continue
+        key = _find_key_for_model(rows, model)
+        if key:
+            os.environ["FREE_API_KEY"] = key
+            env_path = Path(".env")
+            if env_path.exists():
+                text = env_path.read_text()
+                if "FREE_API_KEY=" in text:
+                    text = re.sub(r'^FREE_API_KEY=.*', f'FREE_API_KEY={key}', text, flags=re.MULTILINE)
+                else:
+                    text += f'\nFREE_API_KEY={key}\n'
+                env_path.write_text(text)
+            print(f"  [free] новый ключ: {key[:20]}...")
+            return True
 
-    print(f"  [free] не нашёл ключ для {model}, пробую fetch-keys")
+    print(f"  [free] не нашёл ключ для {model}")
     return False
 
 
