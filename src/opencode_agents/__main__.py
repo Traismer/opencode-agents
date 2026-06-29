@@ -4,11 +4,15 @@ import sys
 import time
 import os
 
+import httpx
+import re
+from pathlib import Path
+
 from opencode_agents.workspace import Workspace
 from opencode_agents.models import HistoryEntry
 from opencode_agents.agents.planner import PlannerAgent
 from opencode_agents.agents.critic import CriticAgent
-from opencode_agents.llm import DeepSeekLLM, FreeLLM, StubLLM
+from opencode_agents.llm import DeepSeekLLM, FreeLLM, StubLLM, FREE_API_MODEL
 
 
 def _resolve_llm():
@@ -17,6 +21,46 @@ def _resolve_llm():
     if os.environ.get("DEEPSEEK_API_KEY"):
         return DeepSeekLLM()
     return StubLLM()
+
+
+def _refresh_free_key():
+    model = os.environ.get("FREE_API_MODEL", FREE_API_MODEL)
+    print(f"  [free] ключ умер, ищу свежий для {model}...")
+    try:
+        resp = httpx.get(
+            "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/main/README.md",
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  [free] ошибка загрузки ключей: {e}")
+        return False
+
+    sections = re.split(r'\n(?=###\s)', resp.text)
+    for sec in sections:
+        rows = re.findall(r'\|\s*`(sk-\w+)`\s*\|\s*(\S+?)\s*\|', sec)
+        for key, m in rows:
+            if m == model:
+                os.environ["FREE_API_KEY"] = key
+                env_path = Path(".env")
+                if env_path.exists():
+                    text = env_path.read_text()
+                    if "FREE_API_KEY=" in text:
+                        text = re.sub(r'^FREE_API_KEY=.*', f'FREE_API_KEY={key}', text, flags=re.MULTILINE)
+                    else:
+                        text += f'\nFREE_API_KEY={key}\n'
+                    env_path.write_text(text)
+                print(f"  [free] новый ключ: {key[:20]}...")
+                return True
+
+    print(f"  [free] не нашёл ключ для {model}, пробую fetch-keys")
+    return False
+
+
+def _is_auth_error(e: Exception) -> bool:
+    if isinstance(e, httpx.HTTPStatusError):
+        return e.response.status_code in (401, 402, 403, 429)
+    return False
 
 
 def cmd_create_task(ws: Workspace, args: list[str]):
@@ -81,50 +125,68 @@ def cmd_advance(ws: Workspace, args: list[str]):
         print(f"  [{task_id}] достигнут лимит итераций ({session.max_iterations})")
         return
 
-    llm = _resolve_llm()
+    for attempt in range(3):
+        try:
+            llm = _resolve_llm()
+            if session.status == "planner_turn":
+                agent = PlannerAgent(llm=llm)
+                result = agent.process(session)
+                plan = result.get("plan", result["content"])
+                session.plan = plan
+                session.history.append(HistoryEntry(
+                    role="planner", content=result["content"], iteration=session.iteration
+                ))
+                session.status = "critic_turn"
+                ws.update_session(session)
+                print(f"  [planner] итер {session.iteration} — план обновлён ({len(plan)} симв.)")
+                return
 
-    if session.status == "planner_turn":
-        agent = PlannerAgent(llm=llm)
-        result = agent.process(session)
-        plan = result.get("plan", result["content"])
-        session.plan = plan
-        session.history.append(HistoryEntry(
-            role="planner", content=result["content"], iteration=session.iteration
-        ))
-        session.status = "critic_turn"
-        ws.update_session(session)
-        print(f"  [planner] итер {session.iteration} — план обновлён ({len(plan)} симв.)")
+            elif session.status == "critic_turn":
+                agent = CriticAgent(llm=llm)
+                result = agent.process(session)
+                session.history.append(HistoryEntry(
+                    role="critic", content=result["content"], iteration=session.iteration
+                ))
+                if result.get("approved"):
+                    session.status = "approved"
+                    ws.update_session(session)
+                    print(f"  [critic] итер {session.iteration} — ОДОБРЕНО")
+                elif session.iteration >= session.max_iterations - 1:
+                    session.status = "max_iterations"
+                    ws.update_session(session)
+                    print(f"  [critic] итер {session.iteration} — лимит итераций")
+                else:
+                    session.iteration += 1
+                    session.status = "planner_turn"
+                    ws.update_session(session)
+                    print(f"  [critic] итер {session.iteration - 1} — замечания")
+                return
 
-    elif session.status == "critic_turn":
-        agent = CriticAgent(llm=llm)
-        result = agent.process(session)
-        session.history.append(HistoryEntry(
-            role="critic", content=result["content"], iteration=session.iteration
-        ))
-        if result.get("approved"):
-            session.status = "approved"
-            ws.update_session(session)
-            print(f"  [critic] итер {session.iteration} — ОДОБРЕНО")
-        elif session.iteration >= session.max_iterations - 1:
-            session.status = "max_iterations"
-            ws.update_session(session)
-            print(f"  [critic] итер {session.iteration} — лимит итераций")
-        else:
-            session.iteration += 1
-            session.status = "planner_turn"
-            ws.update_session(session)
-            print(f"  [critic] итер {session.iteration - 1} — замечания")
+        except Exception as e:
+            if _is_auth_error(e) and _refresh_free_key():
+                continue
+            print(f"  [{task_id}] ошибка: {e}")
+            return
+
+    print(f"  [{task_id}] не удалось после 3 попыток")
 
 
 def cmd_run_planner(ws: Workspace, args: list[str]):
-    llm = _resolve_llm()
-    agent = PlannerAgent(llm=llm)
+    agent = PlannerAgent(llm=_resolve_llm())
     print("[planner] ожидание задач...")
     while True:
         for t in ws.list_tasks():
             session = ws.read_session(t.task_id)
             if session and session.status == "planner_turn":
-                result = agent.process(session)
+                try:
+                    result = agent.process(session)
+                except Exception as e:
+                    if _is_auth_error(e) and _refresh_free_key():
+                        agent = PlannerAgent(llm=_resolve_llm())
+                        continue
+                    print(f"  [planner] {t.task_id} ошибка: {e}")
+                    time.sleep(10)
+                    continue
                 session.plan = result.get("plan", result["content"])
                 session.history.append(HistoryEntry(
                     role="planner", content=result["content"], iteration=session.iteration
@@ -136,14 +198,21 @@ def cmd_run_planner(ws: Workspace, args: list[str]):
 
 
 def cmd_run_critic(ws: Workspace, args: list[str]):
-    llm = _resolve_llm()
-    agent = CriticAgent(llm=llm)
+    agent = CriticAgent(llm=_resolve_llm())
     print("[critic] ожидание задач...")
     while True:
         for t in ws.list_tasks():
             session = ws.read_session(t.task_id)
             if session and session.status == "critic_turn":
-                result = agent.process(session)
+                try:
+                    result = agent.process(session)
+                except Exception as e:
+                    if _is_auth_error(e) and _refresh_free_key():
+                        agent = CriticAgent(llm=_resolve_llm())
+                        continue
+                    print(f"  [critic] {t.task_id} ошибка: {e}")
+                    time.sleep(10)
+                    continue
                 session.history.append(HistoryEntry(
                     role="critic", content=result["content"], iteration=session.iteration
                 ))
@@ -164,9 +233,6 @@ def cmd_run_critic(ws: Workspace, args: list[str]):
 
 
 def cmd_fetch_keys(ws: Workspace, args: list[str]):
-    import httpx
-    import re
-
     print("Загрузка ключей из alistaitsacle/free-llm-api-keys...")
     try:
         resp = httpx.get("https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/main/README.md", timeout=30)
