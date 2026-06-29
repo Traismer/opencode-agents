@@ -98,7 +98,21 @@ files = [
 [package.extras]
 all = ["mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
+[[package]]
+name = "python-dotenv"
+version = "1.2.2"
+description = "Read key-value pairs from a .env file and set them as environment variables"
+optional = false
+python-versions = ">=3.10"
+files = [
+    {file = "python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a"},
+    {file = "python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3"},
+]
+
+[package.extras]
+cli = ["click (>=5.0)"]
+
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.13"
-content-hash = "89d7146b2567e6488bf61fb7fb7606a9d8c00091b98c0e9ab1963b7fd84fad7a"
+content-hash = "2a6a98d1e752c79ad509b4b46b7fe6c1ebc3d25540f81cde73f8a31612fca682"

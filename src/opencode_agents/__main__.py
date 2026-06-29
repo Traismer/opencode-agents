@@ -226,6 +226,8 @@ COMMANDS = {
 
 
 def main():
+    from dotenv import load_dotenv
+    load_dotenv()
     ws = Workspace()
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         help_text()

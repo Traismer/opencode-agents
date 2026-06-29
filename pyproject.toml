@@ -9,6 +9,7 @@ packages = [{ include = "opencode_agents", from = "src" }]
 [tool.poetry.dependencies]
 python = "^3.13"
 httpx = "^0.28.0"
+python-dotenv = "^1.2.2"
 
 
 [build-system]
