@@ -1,134 +1,134 @@
 # opencode-agents
 
-Фреймворк для оркестрации нескольких AI-агентов, которые общаются через файлы.
-
-Агенты не вызывают друг друга напрямую — каждый пишет JSON-файлы в общую рабочую директорию `workflow/` и читает оттуда. Это позволяет запускать агентов в разных процессах, перезапускать по отдельности и видеть всю историю работы.
+Итеративный цикл двух AI-агентов: **Planner** пишет план, **Critic** проверяет.
+Общий файл сессии — единственная точка координации.
 
 ## Быстрый старт
 
 ```sh
-poetry install                      # создать .venv/
-poetry run python -m opencode_agents demo   # запустить демо-пайплайн
+poetry install
+
+export DEEPSEEK_API_KEY="sk-..."
+poetry run python -m opencode_agents task "FastAPI REST API для заметок"
+poetry run python -m opencode_agents advance task-abc123   # planner пишет план
+poetry run python -m opencode_agents advance task-abc123   # critic проверяет
+poetry run python -m opencode_agents advance task-abc123   # planner уточняет
+poetry run python -m opencode_agents advance task-abc123   # critic аппрувит
 ```
 
-Демо создаст задачу «написать калькулятор»,分解 её на подзадачи, запустит кодеров и ревьюера, соберёт результат.
+Без `DEEPSEEK_API_KEY` — `StubLLM` (всегда аппрувит). Для теста без API-ключа:
+
+```sh
+poetry run python -m opencode_agents task "CLI утилита"
+poetry run python -m opencode_agents advance task-abc123   # planner → заглушка
+poetry run python -m opencode_agents advance task-abc123   # critic → APPROVED
+```
 
 ## Архитектура
 
 ```
-workflow/
-  inbox/coder/          ← новые подзадачи для кодера
-  inbox/reviewer/       ← новые подзадачи для ревьюера
-  in_progress/          ← взятые в работу (ещё не готовы)
-  done/                 ← завершённые результаты
-  state/                ← фаза обработки (init → collect → review → done)
-  results/              ← финальные артефакты
-tasks/                  ← входные описания задач
+                    ┌──────────────────┐
+                    │  workflow/       │
+                    │  sessions/       │
+                    │  task-*.json     │ ◄── общий файл сессии
+                    └────────┬─────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+     ┌────────▼────────┐          ┌─────────▼────────┐
+     │   PlannerAgent  │          │   CriticAgent    │
+     │                 │          │                  │
+     │   пишет план    │──iter──► │   проверяет      │──iter──►
+     │   уточняет      │          │   аппрувит       │
+     │   по feedback   │◄─────────│   или feedback   │
+     └─────────────────┘          └──────────────────┘
 ```
 
-**Поток одной задачи:**
-1. Ты кладёшь задачу в `tasks/` (через CLI)
-2. **Оркестратор** читает задачу, раскладывает подзадачи по `inbox/coder/`
-3. **Кодер** забирает подзадачу, пишет код, кладёт результат в `done/`
-4. Оркестратор видит, что всё готово, кладёт подзадачу в `inbox/reviewer/`
-5. **Ревьюер** проверяет код, пишет отзыв в `done/`
-6. Оркестратор собирает финальный артефакт в `workflow/results/`
+Агенты **никогда не вызывают друг друга напрямую**. Они читают и пишут один JSON-файл сессии в `workflow/sessions/<task_id>.json`. Это позволяет запускать их в разных процессах, перезапускать по отдельности и видеть всю историю.
 
 ## Команды
 
 ```sh
-# Управление задачами
-poetry run python -m opencode_agents task "CLI утилита" --reqs "парсинг аргументов" "вывод справки"
-poetry run python -m opencode_agents list
-poetry run python -m opencode_agents status <task_id>
-
-# Оркестрация (один шаг)
-poetry run python -m opencode_agents orchestrate <task_id>
-
-# Запуск агентов (бесконечный цикл, ждут новые подзадачи)
-poetry run python -m opencode_agents run-coder      # в терминале 1
-poetry run python -m opencode_agents run-reviewer   # в терминале 2
-
-# Демо
-poetry run python -m opencode_agents demo
+task <описание>              Создать новую задачу
+list                         Список всех задач
+status <task_id>             Статус и текущий план
+advance <task_id>            Один шаг: planner или critic
+run-planner                  Демон planner (бесконечный цикл)
+run-critic                   Демон critic (бесконечный цикл)
 ```
 
-## Мультипроцесс
+## Итеративный цикл
 
-В трёх терминалах:
+1. `task "..."` → создаётся сессия со статусом `planner_turn`
+2. `advance` → **PlannerAgent** пишет план, статус → `critic_turn`
+3. `advance` → **CriticAgent** проверяет:
+   - `APPROVED` — план отличный, статус → `approved` ✅
+   - `Feedback` — нужны улучшения, статус → `planner_turn`, итерация +1
+4. Повтор п.2-3 до аппрува или лимита итераций (по умолчанию 5)
+
+## Пример сессии
 
 ```sh
-# Терминал 1: следит за кодингом
-poetry run python -m opencode_agents run-coder
+$ poetry run python -m opencode_agents task "FastAPI + SQLAlchemy"
+Создана задача: task-a1b2c3d4
 
-# Терминал 2: следит за ревью
-poetry run python -m opencode_agents run-reviewer
+$ poetry run python -m opencode_agents advance task-a1b2c3d4
+  [planner] итер 0 — план обновлён (2847 симв.)
 
-# Терминал 3: оркестрируем
-poetry run python -m opencode_agents task "моя задача" --reqs "шаг1" "шаг2" "шаг3"
-poetry run python -m opencode_agents orchestrate task-xxxx   # decompose
-poetry run python -m opencode_agents orchestrate task-xxxx   # collect
-poetry run python -m opencode_agents orchestrate task-xxxx   # finalize
+$ poetry run python -m opencode_agents advance task-a1b2c3d4
+  [critic] итер 0 — замечания
+
+$ poetry run python -m opencode_agents advance task-a1b2c3d4
+  [planner] итер 1 — план обновлён (3102 симв.)
+
+$ poetry run python -m opencode_agents advance task-a1b2c3d4
+  [critic] итер 1 — ОДОБРЕНО
+
+$ poetry run python -m opencode_agents status task-a1b2c3d4
+Задача: task-a1b2c3d4
+  статус: approved
+  итерация: 1/5
+  записей в истории: 4
 ```
+
+## Переменные окружения
+
+| Переменная | Назначение |
+|-----------|-----------|
+| `DEEPSEEK_API_KEY` | API-ключ DeepSeek для реального LLM (без него — StubLLM) |
 
 ## Создать нового агента
 
-Наследуйся от `BaseAgent`:
-
 ```python
 from opencode_agents.base_agent import BaseAgent
+from opencode_agents.models import Session
 
-class TesterAgent(BaseAgent):
-    role = "tester"
+class MyAgent(BaseAgent):
+    role = "myrole"
 
-    def process(self, subtask: dict) -> dict:
-        code = subtask.get("instruction", "")
-        tests = self.llm.generate(f"Напиши тесты для:\n{code}")
-        return {
-            "task_id": subtask["task_id"],
-            "status": "done",
-            "output": tests,
-            "files": [{"path": "test_example.py", "content": tests}],
-        }
+    def process(self, session: Session, **kwargs) -> dict:
+        # self.llm.generate(prompt) — доступен
+        return {"content": "...", ...}
 ```
 
-Оркестратор будет класть подзадачи в `inbox/tester/`, а твой агент — забирать их оттуда.
-
-## Подключить реальную LLM
-
-```python
-from opencode_agents.llm import BaseLLM
-from opencode_agents.agents.coder import CoderAgent
-
-class MyLLM(BaseLLM):
-    def generate(self, prompt: str, **kwargs) -> str:
-        # ... вызов OpenAI / Anthropic / локальной модели ...
-        return response
-
-coder = CoderAgent(ws, llm=MyLLM())
-coder.run_loop()
-```
-
-Сейчас используется `StubLLM`, который возвращает заглушки — чтобы можно было тестировать пайплайн без API-ключей.
+Подробнее: [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md)
 
 ## Структура пакета
 
 ```
 src/opencode_agents/
-├── __main__.py          # CLI entrypoint
-├── models.py            # Task, Subtask, Result
-├── workspace.py         # файловое I/O
-├── llm.py               # BaseLLM + StubLLM
-├── base_agent.py        # BaseAgent (run_once / run_loop)
+├── __main__.py          CLI — task/list/status/advance/run-*
+├── models.py            Task, Session, HistoryEntry
+├── workspace.py         Файловое I/O: tasks/ + sessions/
+├── llm.py               BaseLLM, StubLLM, DeepSeekLLM
+├── base_agent.py        BaseAgent (ABC)
+├── tools.py             Заглушка для context7 (доступен через opencode)
 └── agents/
-    ├── orchestrator.py  # конечный автомат
-    ├── coder.py         # пишет код
-    └── reviewer.py      # ревьюит код
+    ├── planner.py       PlannerAgent — пишет план
+    └── critic.py        CriticAgent — ревьюит план
 ```
 
-## Куда двигаться
+## Документация
 
-- Заменить `StubLLM` на реальную модель
-- Добавить новых агентов (tester, deployer, documenter)
-- Добавить таймауты и повторные попытки для подзадач
-- Написать простой веб-интерфейс для просмотра `workflow/`
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — детальная архитектура
+- [AGENT_GUIDE.md](docs/AGENT_GUIDE.md) — создание новых агентов

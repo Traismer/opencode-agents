@@ -37,24 +37,25 @@ codemod_agent.py          # Python-ядро на LibCST
 ```python
 from skill_codemod import Scope
 
-code_scope = Scope("coder")
-review_scope = Scope("reviewer")
+planner_scope = Scope("planner")
+critic_scope = Scope("critic")
 
-@code_scope.hook("pre_codemod")
+@planner_scope.hook("pre_codemod")
 def fix_imports(node):
     ...
 
-@review_scope.hook("post_codemod")
+@critic_scope.hook("post_codemod")
 def validate(node):
     ...
 ```
+
+Система агентов проекта: **PlannerAgent** (пишет план) и **CriticAgent** (ревьюит).
 
 ## Пример
 
 ```python
 from skill_codemod import compare_and_update
 
-# Анализируем diff и обновляем skill
 diff = compare_and_update(
     old_path="skills/my-skill/SKILL.md",
     new_code=generated_code,

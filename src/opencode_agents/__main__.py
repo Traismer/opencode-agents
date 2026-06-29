@@ -1,140 +1,189 @@
 from __future__ import annotations
 
 import sys
-import json
 import time
-from pathlib import Path
+import os
 
 from opencode_agents.workspace import Workspace
-from opencode_agents.models import Task
-from opencode_agents.agents.orchestrator import OrchestratorAgent
-from opencode_agents.agents.coder import CoderAgent
-from opencode_agents.agents.reviewer import ReviewerAgent
+from opencode_agents.models import HistoryEntry
+from opencode_agents.agents.planner import PlannerAgent
+from opencode_agents.agents.critic import CriticAgent
+from opencode_agents.llm import DeepSeekLLM, StubLLM
+
+
+def _resolve_llm():
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if api_key:
+        return DeepSeekLLM(api_key=api_key)
+    return StubLLM()
 
 
 def cmd_create_task(ws: Workspace, args: list[str]):
     if not args:
-        print("Usage: python -m opencode_agents task <description> [--reqs 'r1' 'r2']")
+        print("Использование: python -m opencode_agents task <описание>")
         return
-    desc = args[0]
-    reqs = []
-    if "--reqs" in args:
-        idx = args.index("--reqs")
-        reqs = args[idx + 1:]
-    task = Task(description=desc, requirements=reqs or [desc])
-    ws.put_task(task.to_dict())
-    print(f"Created task: {task.id}")
-    print(f"  description: {desc}")
-    print(f"  requirements: {reqs or [desc]}")
-    print(f"  file: tasks/{task.id}.json")
-
-
-def cmd_orchestrate(ws: Workspace, args: list[str]):
-    if not args:
-        print("Usage: python -m opencode_agents orchestrate <task_id>")
-        return
-    agent = OrchestratorAgent(ws)
-    agent.process_task(args[0])
-
-
-def cmd_run_coder(ws: Workspace, args: list[str]):
-    agent = CoderAgent(ws)
-    agent.run_loop()
-
-
-def cmd_run_reviewer(ws: Workspace, args: list[str]):
-    agent = ReviewerAgent(ws)
-    agent.run_loop()
+    desc = " ".join(args)
+    task = ws.create_task(desc)
+    session = ws.create_session(task)
+    print(f"Создана задача: {task.task_id}")
+    print(f"  описание: {desc}")
+    print(f"  статус: {session.status}")
+    print(f"  файл: tasks/{task.task_id}.json")
 
 
 def cmd_list(ws: Workspace, args: list[str]):
     tasks = ws.list_tasks()
     if not tasks:
-        print("No tasks found.")
+        print("Нет задач.")
         return
-    print("Tasks:")
+    print("Задачи:")
     for t in tasks:
-        state = ws.get_state(t["id"])
-        phase = state["phase"] if state else "—"
-        print(f"  {t['id']}: {t['description'][:50]} [{phase}]")
+        session = ws.read_session(t.task_id)
+        status = session.status if session else "нет сессии"
+        print(f"  {t.task_id}: {t.description[:60]} [{status}]")
 
 
 def cmd_status(ws: Workspace, args: list[str]):
     if not args:
-        print("Usage: python -m opencode_agents status <task_id>")
+        print("Использование: python -m opencode_agents status <task_id>")
         return
-    task = ws.get_task(args[0])
-    if not task:
-        print("Task not found")
+    session = ws.read_session(args[0])
+    if not session:
+        print("Сессия не найдена")
         return
-    state = ws.get_state(args[0])
-    codings = ws.get_results(task_id=args[0], role="coder")
-    reviews = ws.get_results(task_id=args[0], role="reviewer")
+    print(f"Задача: {session.task_id}")
+    print(f"  описание: {session.task_description}")
+    print(f"  статус: {session.status}")
+    print(f"  итерация: {session.iteration}/{session.max_iterations}")
+    print(f"  записей в истории: {len(session.history)}")
+    if session.plan:
+        preview = session.plan[:300].replace("\n", "\n  ")
+        print(f"  план (начало):")
+        print(f"    {preview}...")
+        print(f"  (полный план: {len(session.plan)} символов)")
 
-    print(f"Task: {task['id']}")
-    print(f"  description: {task.get('description', '')}")
-    print(f"  phase: {state['phase'] if state else 'init'}")
-    print(f"  coding results: {len(codings)}/{len(task.get('requirements', []))}")
-    print(f"  review results: {len(reviews)}")
+
+def cmd_advance(ws: Workspace, args: list[str]):
+    if not args:
+        print("Использование: python -m opencode_agents advance <task_id>")
+        return
+    task_id = args[0]
+    session = ws.read_session(task_id)
+    if not session:
+        print(f"Сессия не найдена для {task_id}")
+        return
+
+    if session.status == "approved":
+        print(f"  [{task_id}] уже одобрено")
+        return
+    if session.status == "max_iterations":
+        print(f"  [{task_id}] достигнут лимит итераций ({session.max_iterations})")
+        return
+
+    llm = _resolve_llm()
+
+    if session.status == "planner_turn":
+        agent = PlannerAgent(llm=llm)
+        result = agent.process(session)
+        plan = result.get("plan", result["content"])
+        session.plan = plan
+        session.history.append(HistoryEntry(
+            role="planner", content=result["content"], iteration=session.iteration
+        ))
+        session.status = "critic_turn"
+        ws.update_session(session)
+        print(f"  [planner] итер {session.iteration} — план обновлён ({len(plan)} симв.)")
+
+    elif session.status == "critic_turn":
+        agent = CriticAgent(llm=llm)
+        result = agent.process(session)
+        session.history.append(HistoryEntry(
+            role="critic", content=result["content"], iteration=session.iteration
+        ))
+        if result.get("approved"):
+            session.status = "approved"
+            ws.update_session(session)
+            print(f"  [critic] итер {session.iteration} — ОДОБРЕНО")
+        elif session.iteration >= session.max_iterations - 1:
+            session.status = "max_iterations"
+            ws.update_session(session)
+            print(f"  [critic] итер {session.iteration} — лимит итераций")
+        else:
+            session.iteration += 1
+            session.status = "planner_turn"
+            ws.update_session(session)
+            print(f"  [critic] итер {session.iteration - 1} — замечания")
 
 
-def cmd_demo(ws: Workspace, args: list[str]):
-    task = Task(
-        description="Build a simple CLI calculator",
-        requirements=["add function", "subtract function", "main entry point"],
-        language="python",
-    )
-    ws.put_task(task.to_dict())
-    print(f"Demo task created: {task.id}")
-    print()
+def cmd_run_planner(ws: Workspace, args: list[str]):
+    llm = _resolve_llm()
+    agent = PlannerAgent(llm=llm)
+    print("[planner] ожидание задач...")
+    while True:
+        for t in ws.list_tasks():
+            session = ws.read_session(t.task_id)
+            if session and session.status == "planner_turn":
+                result = agent.process(session)
+                session.plan = result.get("plan", result["content"])
+                session.history.append(HistoryEntry(
+                    role="planner", content=result["content"], iteration=session.iteration
+                ))
+                session.status = "critic_turn"
+                ws.update_session(session)
+                print(f"  [planner] {t.task_id} итер {session.iteration} — готово")
+        time.sleep(2)
 
-    orchestrator = OrchestratorAgent(ws)
 
-    print("\n=== Phase 1: decompose ===")
-    orchestrator.process_task(task.id)
-    print("  inbox/coder/ now has subtasks\n")
-
-    time.sleep(0.2)
-
-    print("=== Phase 2: run coder agent ===")
-    coder = CoderAgent(ws)
-    while coder.run_once():
-        pass
-
-    print("\n=== Phase 3: orchestrator collects ===")
-    orchestrator.process_task(task.id)
-
-    print("\n=== Phase 4: run reviewer agent ===")
-    reviewer = ReviewerAgent(ws)
-    reviewer.run_once()
-
-    print("\n=== Phase 5: orchestrator finalizes ===")
-    orchestrator.process_task(task.id)
-
-    print(f"\n✅ Done! Check workflow/results/{task.id}.json")
+def cmd_run_critic(ws: Workspace, args: list[str]):
+    llm = _resolve_llm()
+    agent = CriticAgent(llm=llm)
+    print("[critic] ожидание задач...")
+    while True:
+        for t in ws.list_tasks():
+            session = ws.read_session(t.task_id)
+            if session and session.status == "critic_turn":
+                result = agent.process(session)
+                session.history.append(HistoryEntry(
+                    role="critic", content=result["content"], iteration=session.iteration
+                ))
+                if result.get("approved"):
+                    session.status = "approved"
+                    ws.update_session(session)
+                    print(f"  [critic] {t.task_id} итер {session.iteration} — ОДОБРЕНО")
+                elif session.iteration >= session.max_iterations - 1:
+                    session.status = "max_iterations"
+                    ws.update_session(session)
+                    print(f"  [critic] {t.task_id} итер {session.iteration} — лимит итераций")
+                else:
+                    session.iteration += 1
+                    session.status = "planner_turn"
+                    ws.update_session(session)
+                    print(f"  [critic] {t.task_id} итер {session.iteration - 1} — замечания")
+        time.sleep(2)
 
 
 def help_text():
-    print("Usage: python -m opencode_agents <command> [args]")
+    print("Использование: python -m opencode_agents <команда> [args]")
     print()
-    print("Commands:")
-    print("  task <desc> --reqs r1 r2    Create a new task")
-    print("  list                         List all tasks")
-    print("  status <task_id>            Show task status")
-    print("  orchestrate <task_id>       Run one orchestrator cycle")
-    print("  run-coder                   Run coder agent (loop)")
-    print("  run-reviewer                Run reviewer agent (loop)")
-    print("  demo                        Run a full demo pipeline")
+    print("Команды:")
+    print("  task <описание>              Создать новую задачу с сессией")
+    print("  list                         Список задач")
+    print("  status <task_id>             Статус сессии")
+    print("  advance <task_id>            Один шаг (planner или critic)")
+    print("  run-planner                  Демон planner (цикл)")
+    print("  run-critic                   Демон critic (цикл)")
+    print()
+    print("Переменные окружения:")
+    print("  DEEPSEEK_API_KEY             API-ключ DeepSeek (без него — StubLLM)")
 
 
 COMMANDS = {
     "task": cmd_create_task,
     "list": cmd_list,
     "status": cmd_status,
-    "orchestrate": cmd_orchestrate,
-    "run-coder": cmd_run_coder,
-    "run-reviewer": cmd_run_reviewer,
-    "demo": cmd_demo,
+    "advance": cmd_advance,
+    "run-planner": cmd_run_planner,
+    "run-critic": cmd_run_critic,
 }
 
 
@@ -143,13 +192,12 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         help_text()
         return
-
     cmd = sys.argv[1]
     args = sys.argv[2:]
     if cmd in COMMANDS:
         COMMANDS[cmd](ws, args)
     else:
-        print(f"Unknown command: {cmd}")
+        print(f"Неизвестная команда: {cmd}")
         help_text()
 
 
